@@ -10,12 +10,6 @@ const openai = new OpenAI({
   dangerouslyAllowBrowser: true
 });
 
-// Create a separate OpenAI instance for the analyzer
-const analyzerAI = new OpenAI({
-  apiKey: import.meta.env.VITE_OPENAI_API_KEY,
-  dangerouslyAllowBrowser: true
-});
-
 const WorkflowManager = () => {
   const [agents, setAgents] = useState(() => {
     try {
@@ -51,19 +45,33 @@ const WorkflowManager = () => {
       return [];
     }
   });
+  
   const [messages, setMessages] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [userInput, setUserInput] = useState('');
   const [showSettings, setShowSettings] = useState(false);
-  const [saveStatus, setSaveStatus] = useState('');
   const [showAllResponses, setShowAllResponses] = useState(() => {
     return localStorage.getItem('showAllResponses') === 'true';
+  });
+  const [useAllAgents, setUseAllAgents] = useState(() => {
+    return localStorage.getItem('useAllAgents') === 'true';
   });
   const [thinkingTime, setThinkingTime] = useState(0);
   const [thinkingTimer, setThinkingTimer] = useState(null);
   const [finalThinkingTime, setFinalThinkingTime] = useState(null);
   const [currentThread, setCurrentThread] = useState(null);
   const chatEndRef = useRef(null);
+
+  // Save settings when they change
+  useEffect(() => {
+    try {
+      localStorage.setItem('workflowAgents', JSON.stringify(agents));
+      localStorage.setItem('showAllResponses', showAllResponses);
+      localStorage.setItem('useAllAgents', useAllAgents);
+    } catch (error) {
+      console.error('Error saving settings:', error);
+    }
+  }, [agents, showAllResponses, useAllAgents]);
 
   // Update thinking time every second while processing
   useEffect(() => {
@@ -79,13 +87,6 @@ const WorkflowManager = () => {
       setFinalThinkingTime(thinkingTime);
     }
   }, [isProcessing, showAllResponses]);
-
-  const formatThinkingTime = (seconds) => {
-    if (!seconds && seconds !== 0) return '';
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = seconds % 60;
-    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
-  };
 
   // Initialize thread when component mounts
   useEffect(() => {
@@ -118,9 +119,8 @@ const WorkflowManager = () => {
         await createNewThread();
       }
 
-      const analysis = await analyzeQueryComplexity(userInput);
       const sortedAgents = [...agents].sort((a, b) => a.order - b.order);
-      const agentsToUse = analysis.isComplex ? sortedAgents : [sortedAgents[0]];
+      const agentsToUse = useAllAgents ? sortedAgents : [sortedAgents[0]];
       let previousResponses = [];
       const startTime = Date.now();
 
@@ -159,7 +159,7 @@ const WorkflowManager = () => {
           const totalThinkingTime = Math.round((Date.now() - startTime) / 1000);
 
           // Update messages based on visibility settings
-          if (showAllResponses || (isFirstAgent && agentsToUse.length > 1) || isLastAgent) {
+          if (showAllResponses || isLastAgent) {
             setMessages(prev => 
               prev.map(msg => 
                 msg.type === 'thinking' && msg.agentId === agent.id
@@ -266,135 +266,6 @@ const WorkflowManager = () => {
     }
   };
 
-  // Separate analyzer function with its own thread
-  const analyzeQueryComplexity = async (query) => {
-    try {
-      const analyzerThread = await analyzerAI.beta.threads.create();
-
-      await analyzerAI.beta.threads.messages.create(
-        analyzerThread.id,
-        {
-          role: 'user',
-          content: `Query: "${query}"
-
-You are a Query Complexity Analyzer specialized in identifying coding and technical problems.
-
-ALWAYS SIMPLE (return isComplex: false):
-1. Personal Information:
-   - Names (My name is X)
-   - Introductions
-   - Personal details
-   - Basic preferences
-
-2. Basic Interactions:
-   - Greetings (hi, hello)
-   - How are you
-   - Thank you
-   - Goodbyes
-   - Simple questions
-   - Basic clarifications
-
-3. General Knowledge:
-   - Simple facts
-   - Basic definitions
-   - Yes/no questions
-   - Time/date queries
-   - Location questions
-   - Simple what/where/when questions
-
-COMPLEX ONLY IF (return isComplex: true):
-1. Programming Related:
-   - Code writing requests
-   - Debugging help
-   - Error explanations
-   - Implementation questions
-   - Algorithm discussions
-   - Code optimization
-
-2. Technical Problems:
-   - System architecture
-   - Database design
-   - API integration
-   - Performance issues
-   - Security concerns
-
-3. Multi-step Problems:
-   - Requires research
-   - Needs code examples
-   - Multiple concepts involved
-   - Step-by-step explanations needed
-
-STRICT RULES:
-1. Default to SIMPLE unless explicitly technical/coding related
-2. Personal information is ALWAYS simple
-3. General knowledge is ALWAYS simple
-4. Must contain technical keywords to be complex:
-   - code, programming, function, error, debug
-   - database, API, server, implementation
-   - algorithm, optimize, architecture
-   - security, performance, integration
-
-Respond with ONLY: {"isComplex": boolean}
-
-Current query length: ${query.split(' ').length} words
-Contains technical terms: ${/\b(code|program|function|error|debug|database|api|server|implement|algorithm|optimize|architecture|security|performance|integration)\b/i.test(query)}`
-        }
-      );
-
-      const run = await analyzerAI.beta.threads.runs.create(
-        analyzerThread.id,
-        {
-          assistant_id: "asst_temp_analyzer",
-          instructions: "You are a Query Complexity Analyzer specialized in identifying coding and technical problems. Mark as complex ONLY if the query is explicitly about programming, coding, or technical system design. Everything else should be simple. Return only JSON with isComplex boolean."
-        }
-      );
-
-      let runStatus = await analyzerAI.beta.threads.runs.retrieve(
-        analyzerThread.id,
-        run.id
-      );
-
-      while (runStatus.status !== 'completed') {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        runStatus = await analyzerAI.beta.threads.runs.retrieve(
-          analyzerThread.id,
-          run.id
-        );
-      }
-
-      const messages = await analyzerAI.beta.threads.messages.list(
-        analyzerThread.id
-      );
-
-      const result = JSON.parse(messages.data[0].content[0].text.value);
-
-      // Clean up analyzer thread
-      await analyzerAI.beta.threads.del(analyzerThread.id);
-
-      // Force simple for personal information and basic interactions
-      if (
-        /\b(my name|i am|call me|nice to meet|pleased to meet)\b/i.test(query) ||
-        query.split(' ').length <= 3 ||
-        /^(hi|hello|hey|thanks|thank you|bye|goodbye)$/i.test(query.trim())
-      ) {
-        return { isComplex: false };
-      }
-
-      // Force complex only for explicit technical terms
-      const technicalTerms = /\b(code|program|function|error|debug|database|api|server|implement|algorithm|optimize|architecture|security|performance|integration)\b/i;
-      if (technicalTerms.test(query)) {
-        return { isComplex: true };
-      }
-
-      return result;
-    } catch (error) {
-      console.error('Error in complexity analysis:', error);
-      // Default to simple unless contains technical terms
-      const technicalTerms = /\b(code|program|function|error|debug|database|api|server|implement|algorithm|optimize|architecture|security|performance|integration)\b/i;
-      return { isComplex: technicalTerms.test(query) };
-    }
-  };
-
   const addAgent = () => {
     const newAgent = {
       id: Date.now(),
@@ -431,6 +302,7 @@ Contains technical terms: ${/\b(code|program|function|error|debug|database|api|s
     try {
       const savedAgents = localStorage.getItem('workflowAgents');
       const savedShowAllResponses = localStorage.getItem('showAllResponses');
+      const savedUseAllAgents = localStorage.getItem('useAllAgents');
       
       if (savedAgents) {
         const parsedAgents = JSON.parse(savedAgents);
@@ -448,6 +320,10 @@ Contains technical terms: ${/\b(code|program|function|error|debug|database|api|s
 
       if (savedShowAllResponses !== null) {
         setShowAllResponses(savedShowAllResponses === 'true');
+      }
+
+      if (savedUseAllAgents !== null) {
+        setUseAllAgents(savedUseAllAgents === 'true');
       }
     } catch (error) {
       console.error('Error loading settings:', error);
@@ -508,11 +384,17 @@ Contains technical terms: ${/\b(code|program|function|error|debug|database|api|s
     );
   };
 
+  const formatThinkingTime = (seconds) => {
+    if (!seconds && seconds !== 0) return '';
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+
   return (
     <div className="min-h-screen bg-gray-900 text-white">
-      {/* Settings Toggle Button */}
       <button
-        onClick={() => setShowSettings(!showSettings)}
+        onClick={() => setShowSettings(true)}
         className="fixed top-4 right-4 p-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition-colors duration-200"
       >
         <Settings size={20} className="text-blue-400" />
@@ -534,119 +416,130 @@ Contains technical terms: ${/\b(code|program|function|error|debug|database|api|s
               </button>
             </div>
 
-            {/* Agents Configuration */}
-            <div className="space-y-4 mb-6">
-              {agents.map((agent, index) => (
-                <div key={agent.id} className="bg-gray-800 rounded-lg p-4 border border-gray-700">
-                  <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-lg font-medium text-white">Agent {index + 1}</h2>
-                    <div className="flex gap-2">
-                      <button
-                        onClick={() => duplicateAgent(agent)}
-                        className="text-blue-400 hover:text-blue-300 transition-colors duration-200"
-                        title="Duplicate Agent"
-                      >
-                        <Copy size={16} />
-                      </button>
-                      <button
-                        onClick={() => removeAgent(agent.id)}
-                        className="text-red-400 hover:text-red-300 transition-colors duration-200"
-                        title="Remove Agent"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="space-y-4">
-                    <input
-                      type="text"
-                      placeholder="Role (e.g., Senior Developer, Code Reviewer)"
-                      value={agent.role}
-                      onChange={(e) => updateAgent(agent.id, 'role', e.target.value)}
-                      className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+            {/* Settings Panel Content */}
+            <div className="space-y-6">
+              {/* Global Settings */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-white">Global Settings</h3>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-gray-300">Show All Responses</label>
+                  <button
+                    onClick={() => setShowAllResponses(!showAllResponses)}
+                    className="relative inline-block w-12 h-6 rounded-full bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <div
+                      className={`absolute left-1 top-1 w-4 h-4 rounded-full transition-transform duration-200 transform ${
+                        showAllResponses ? 'translate-x-6 bg-blue-400' : 'translate-x-0 bg-gray-300'
+                      }`}
                     />
-                    <textarea
-                      placeholder="Instructions for the agent's behavior and expertise"
-                      value={agent.instructions}
-                      onChange={(e) => updateAgent(agent.id, 'instructions', e.target.value)}
-                      className="w-full bg-gray-700 text-white border-none rounded-lg p-2 h-24 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none"
+                  </button>
+                </div>
+                <div className="flex items-center justify-between">
+                  <label className="text-sm text-gray-300">Use All Agents</label>
+                  <button
+                    onClick={() => setUseAllAgents(!useAllAgents)}
+                    className="relative inline-block w-12 h-6 rounded-full bg-gray-600 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  >
+                    <div
+                      className={`absolute left-1 top-1 w-4 h-4 rounded-full transition-transform duration-200 transform ${
+                        useAllAgents ? 'translate-x-6 bg-blue-400' : 'translate-x-0 bg-gray-300'
+                      }`}
                     />
-                    <div className="space-y-3">
-                      <div>
-                        <label className="text-sm text-gray-300 mb-1 block">Temperature</label>
-                        <input
-                          type="number"
-                          min="0"
-                          max="2"
-                          step="0.1"
-                          value={agent.temperature}
-                          onChange={(e) => updateAgent(agent.id, 'temperature', parseFloat(e.target.value))}
-                          className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-sm text-gray-300 mb-1 block">Max Tokens</label>
-                        <input
-                          type="number"
-                          min="1"
-                          max="4000"
-                          value={agent.maxTokens}
-                          onChange={(e) => updateAgent(agent.id, 'maxTokens', parseInt(e.target.value))}
-                          className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                        />
-                      </div>
-                      <div>
-                        <label className="text-sm text-gray-300 mb-1 block">Response Order</label>
-                        <input
-                          type="number"
-                          min="0"
-                          value={agent.order}
-                          onChange={(e) => updateAgent(agent.id, 'order', parseInt(e.target.value))}
-                          className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                        />
+                  </button>
+                </div>
+              </div>
+
+              {/* Agents Configuration */}
+              <div className="space-y-4">
+                <h3 className="text-lg font-medium text-white">Agents Configuration</h3>
+                {agents.map((agent, index) => (
+                  <div key={agent.id} className="bg-gray-800 rounded-lg p-4 border border-gray-700">
+                    <div className="flex justify-between items-center mb-4">
+                      <h2 className="text-lg font-medium text-white">Agent {index + 1}</h2>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => duplicateAgent(agent)}
+                          className="text-blue-400 hover:text-blue-300 transition-colors duration-200"
+                          title="Duplicate Agent"
+                        >
+                          <Copy size={16} />
+                        </button>
+                        <button
+                          onClick={() => removeAgent(agent.id)}
+                          className="text-red-400 hover:text-red-300 transition-colors duration-200"
+                          title="Remove Agent"
+                        >
+                          <Trash2 size={16} />
+                        </button>
                       </div>
                     </div>
+                    <div className="space-y-4">
+                      <input
+                        type="text"
+                        placeholder="Role (e.g., Senior Developer, Code Reviewer)"
+                        value={agent.role}
+                        onChange={(e) => updateAgent(agent.id, 'role', e.target.value)}
+                        className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                      />
+                      <textarea
+                        placeholder="Instructions for the agent's behavior and expertise"
+                        value={agent.instructions}
+                        onChange={(e) => updateAgent(agent.id, 'instructions', e.target.value)}
+                        className="w-full bg-gray-700 text-white border-none rounded-lg p-2 h-24 focus:ring-2 focus:ring-blue-500 focus:outline-none resize-none"
+                      />
+                      <div className="space-y-3">
+                        <div>
+                          <label className="text-sm text-gray-300 mb-1 block">Temperature</label>
+                          <input
+                            type="number"
+                            min="0"
+                            max="2"
+                            step="0.1"
+                            value={agent.temperature}
+                            onChange={(e) => updateAgent(agent.id, 'temperature', parseFloat(e.target.value))}
+                            className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-300 mb-1 block">Max Tokens</label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="4000"
+                            value={agent.maxTokens}
+                            onChange={(e) => updateAgent(agent.id, 'maxTokens', parseInt(e.target.value))}
+                            className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-sm text-gray-300 mb-1 block">Response Order</label>
+                          <input
+                            type="number"
+                            min="0"
+                            value={agent.order}
+                            onChange={(e) => updateAgent(agent.id, 'order', parseInt(e.target.value))}
+                            className="w-full bg-gray-700 text-white border-none rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                          />
+                        </div>
+                      </div>
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
 
-            {/* Response Display Toggle */}
-            <div className="mb-6 p-4 bg-gray-700 rounded-lg">
-              <label className="flex items-center justify-between cursor-pointer">
-                <span className="text-sm text-gray-300">Show All Agent Responses</span>
-                <div className="relative">
-                  <input
-                    type="checkbox"
-                    className="sr-only"
-                    checked={showAllResponses}
-                    onChange={(e) => setShowAllResponses(e.target.checked)}
-                  />
-                  <div className={`block w-14 h-8 rounded-full transition-colors duration-200 ${showAllResponses ? 'bg-blue-500' : 'bg-gray-600'}`}>
-                    <div className={`absolute left-1 top-1 bg-white w-6 h-6 rounded-full transition-transform duration-200 ${showAllResponses ? 'transform translate-x-6' : ''}`} />
-                  </div>
-                </div>
-              </label>
-              <p className="text-xs text-gray-400 mt-2">
-                {showAllResponses ? 
-                  "Showing responses from all agents in sequence" : 
-                  "Only showing final response with thinking time. Other agents still work in background."}
-              </p>
-            </div>
-
-            <div className="flex justify-between items-center mt-6">
-              <button
-                onClick={addAgent}
-                className="flex items-center gap-2 bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition-colors duration-200"
-              >
-                <PlusCircle size={16} />
-                Add Agent
-              </button>
+              <div className="flex justify-between items-center mt-6">
+                <button
+                  onClick={addAgent}
+                  className="flex items-center gap-2 bg-blue-500 text-white px-4 py-2 rounded-lg hover:bg-blue-600 transition-colors duration-200"
+                >
+                  <PlusCircle size={16} />
+                  Add Agent
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
-
       {/* Main Chat Interface */}
       <div className={`w-full max-w-6xl mx-auto transition-all duration-300 ${showSettings ? 'mr-96' : ''}`}>
         <div className="flex flex-col h-screen">
